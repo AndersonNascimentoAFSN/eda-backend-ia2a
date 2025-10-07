@@ -2,7 +2,7 @@
 Configurações da aplicação usando Pydantic Settings
 """
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import Optional, List
 
 
 class Settings(BaseSettings):
@@ -21,6 +21,18 @@ class Settings(BaseSettings):
     
     # API Settings
     debug: bool = False
+    
+    # CORS Configuration
+    cors_allowed_origins: str = ""
+    
+    def get_cors_allowed_origins(self) -> List[str]:
+        """
+        Retorna lista de origins permitidas para CORS.
+        Se não configurado, permite todas as origins para desenvolvimento.
+        """
+        if self.cors_allowed_origins:
+            return [origin.strip() for origin in self.cors_allowed_origins.split(",")]
+        return ["*"]  # Fallback para desenvolvimento
     
     class Config:
         env_file = ".env"

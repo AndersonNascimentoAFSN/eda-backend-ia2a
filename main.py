@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.endpoints import router as api_router
 from app.api.enhanced_endpoints import router as enhanced_router
+from app.api.cors_proxy import cors_router
 from app.core.database import db_manager
 
 # Criar aplicação FastAPI
@@ -30,6 +31,7 @@ app.add_middleware(
 # Incluir rotas da API
 app.include_router(api_router, prefix="/api/v1", tags=["EDA"])
 app.include_router(enhanced_router, tags=["Enhanced EDA"])
+app.include_router(cors_router, tags=["CORS Proxy"])
 
 # Endpoint raiz
 @app.get("/")
@@ -45,7 +47,8 @@ async def root():
             "upload_csv": "/api/v1/upload-csv",
             "csv_info": "/api/v1/csv-info",
             "supported_formats": "/api/v1/supported-formats",
-            "health": "/api/v1/health"
+            "health": "/api/v1/health",
+            "cors_proxy": "/cors-proxy/test-cors"
         }
     }
 

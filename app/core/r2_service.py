@@ -142,7 +142,16 @@ class CloudflareR2Service:
                     "Content-Type": content_type
                 },
                 "original_filename": filename,
-                "upload_timestamp": datetime.now().isoformat()
+                "upload_timestamp": datetime.now().isoformat(),
+                "cors_info": {
+                    "status": "Configure CORS no dashboard do Cloudflare R2",
+                    "dashboard_url": "https://dash.cloudflare.com/",
+                    "bucket_name": settings.cloudflare_r2_bucket_name,
+                    "required_origins": [
+                        "http://localhost:3000",
+                        "https://*.vercel.app"
+                    ]
+                }
             }
             
         except ClientError as e:
