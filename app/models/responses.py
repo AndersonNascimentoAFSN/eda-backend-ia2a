@@ -82,11 +82,28 @@ class R2ConfigResponse(BaseModel):
     message: str
 
 # Modelos para análise de dados
+class CSVOptions(BaseModel):
+    """Opções específicas para leitura de arquivos CSV"""
+    sep: Optional[str] = None  # Separador (vírgula, ponto-e-vírgula, etc.)
+    encoding: Optional[str] = None  # utf-8, latin-1, cp1252, etc.
+    decimal: Optional[str] = None  # Separador decimal (. ou ,)
+    thousands: Optional[str] = None  # Separador de milhares
+    parse_dates: Optional[List[str]] = None  # Colunas a serem interpretadas como datas
+    date_format: Optional[str] = None  # Formato das datas
+    dtype: Optional[Dict[str, str]] = None  # Tipos específicos para colunas
+    na_values: Optional[List[str]] = None  # Valores a serem tratados como NaN
+    quotechar: Optional[str] = None  # Caractere de aspas
+    quoting: Optional[int] = None  # Comportamento de aspas (0=minimal, 1=all, 2=non-numeric, 3=none)
+    skiprows: Optional[int] = None  # Número de linhas para pular
+    nrows: Optional[int] = None  # Número máximo de linhas para ler
+    header: Optional[int] = None  # Linha do cabeçalho (padrão=0)
+
 class AnalysisStartRequest(BaseModel):
     """Request para iniciar análise"""
     file_key: str
     analysis_type: str = "basic_eda"
     options: Optional[Dict[str, Any]] = None
+    csv_options: Optional[CSVOptions] = None  # Opções específicas para CSV
 
 class AnalysisStartResponse(BaseModel):
     """Resposta ao iniciar análise"""
@@ -112,16 +129,23 @@ class DatasetInfo(BaseModel):
     columns: int
     memory_usage: float
     dtypes: Dict[str, int]
+    file_size: Optional[int] = None
+    column_names: Optional[List[str]] = None
+    data_types: Optional[Dict[str, str]] = None
 
 class ColumnStats(BaseModel):
-    """Estatísticas de uma coluna"""
+    """Estatísticas de uma coluna (flexível para diferentes análises)"""
     name: str
     dtype: str
-    count: int
-    non_null_count: int
-    null_count: int
-    null_percentage: float
-    unique_count: int
+    
+    # Campos básicos (opcionais para flexibilidade)
+    count: Optional[int] = None
+    non_null_count: Optional[int] = None
+    null_count: Optional[int] = None
+    null_percentage: Optional[float] = None
+    unique_count: Optional[int] = None
+    
+    # Campos opcionais que podem existir
     most_frequent: Optional[str] = None
     frequency: Optional[int] = None
     mean: Optional[float] = None
@@ -131,19 +155,59 @@ class ColumnStats(BaseModel):
     max: Optional[float] = None
     q25: Optional[float] = None
     q75: Optional[float] = None
+    
+    # Permitir campos adicionais para advanced_stats
+    class Config:
+        extra = "allow"
 
 class AnalysisSummary(BaseModel):
-    """Resumo da análise"""
-    completeness_score: float
-    numeric_columns: int
-    categorical_columns: int
-    datetime_columns: int
-    recommendations: List[str]
+    """Resumo flexível da análise para diferentes tipos"""
+    # Campos comuns (opcionais para flexibilidade)
+    completeness_score: Optional[float] = None
+    numeric_columns: Optional[int] = None
+    categorical_columns: Optional[int] = None
+    datetime_columns: Optional[int] = None
+    recommendations: Optional[List[str]] = None
+    
+    # Campos específicos para advanced_stats (opcionais)
+    analysis_type: Optional[str] = None
+    dataset_health_score: Optional[float] = None
+    key_findings: Optional[List[str]] = None
+    data_distribution_summary: Optional[Dict[str, Any]] = None
+    relationship_strength: Optional[Dict[str, Any]] = None
+    anomaly_summary: Optional[Dict[str, Any]] = None
+    next_steps: Optional[List[str]] = None
+    
+    # Permitir campos adicionais
+    class Config:
+        extra = "allow"
+
+class CorrelationInfo(BaseModel):
+    """Informação de correlação"""
+    variable1: str
+    variable2: str
+    correlation: float
+    strength: str
+
+class CorrelationResults(BaseModel):
+    """Resultados de correlação flexível para different analysis types"""
+    correlations: Dict[str, Any]  # Pode ser Dict[str, float] ou Dict[str, Dict[str, float]]
+    strong_correlations: List[Dict[str, Any]]  # Flexível para diferentes formatos
 
 class AnalysisResults(BaseModel):
     """Resultados completos da análise"""
     analysis_type: str
     dataset_info: DatasetInfo
     column_stats: List[ColumnStats]
-    correlations: Dict[str, Any]
+    correlations: CorrelationResults
+    data_quality: Dict[str, Any]
     summary: AnalysisSummary
+
+class AnalysisResultResponse(BaseModel):
+    """Resposta completa com resultados da análise"""
+    analysis_id: str
+    status: str
+    file_key: str
+    created_at: str
+    completed_at: Optional[str] = None
+    results: AnalysisResults

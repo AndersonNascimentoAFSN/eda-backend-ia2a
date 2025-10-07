@@ -22,7 +22,7 @@ from ..models.responses import (
     PresignedUploadResponse, PresignedDownloadResponse,
     FileInfoResponse, FileListResponse, R2ConfigResponse,
     AnalysisStartRequest, AnalysisStartResponse, AnalysisStatusResponse,
-    AnalysisResults
+    AnalysisResults, AnalysisResultResponse
 )
 from ..models.analysis import (
     AnalysisRequest, AnalysisStatus, AnalysisResults
@@ -725,127 +725,6 @@ async def upload_and_process_csv(
 # ENDPOINTS DE ANÁLISE DE DADOS
 # =============================================================================
 
-@router.post("/analysis/start", response_model=Dict[str, Any])
-async def start_file_analysis(request: AnalysisRequest):
-    """
-    Iniciar análise de arquivo já enviado para o R2
-    
-    Este endpoint recebe a chave de um arquivo que já foi enviado para o R2
-    e inicia o processo de análise exploratória dos dados.
-    
-    Args:
-        request: Dados da requisição com file_key e tipo de análise
-        
-    Returns:
-        ID da análise criada para acompanhamento
-    """
-    try:
-        # Verificar se o R2 está configurado
-        if not r2_service.is_configured():
-            raise HTTPException(
-                status_code=500, 
-                detail="Cloudflare R2 não está configurado"
-            )
-        
-        # Verificar se o arquivo existe no R2
-        try:
-            file_info = r2_service.get_file_info(request.file_key)
-            if not file_info.get("success", False):
-                raise HTTPException(
-                    status_code=404, 
-                    detail=f"Arquivo não encontrado: {request.file_key}"
-                )
-        except Exception as e:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Erro ao verificar arquivo: {str(e)}"
-            )
-        
-        # Iniciar análise
-        analysis_id = analysis_service.start_analysis(request)
-        
-        return {
-            "success": True,
-            "analysis_id": analysis_id,
-            "status": "pending",
-            "message": "Análise iniciada com sucesso",
-            "file_key": request.file_key,
-            "analysis_type": request.analysis_type
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
-
-
-@router.get("/analysis/status/{analysis_id}", response_model=AnalysisStatus)
-async def get_analysis_status(analysis_id: str):
-    """
-    Verificar status de análise em andamento
-    
-    Args:
-        analysis_id: ID da análise
-        
-    Returns:
-        Status atual da análise
-    """
-    try:
-        status = analysis_service.get_analysis_status(analysis_id)
-        
-        if not status:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Análise não encontrada: {analysis_id}"
-            )
-        
-        return status
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
-
-
-@router.get("/analysis/results/{analysis_id}", response_model=AnalysisResults)
-async def get_analysis_results(analysis_id: str):
-    """
-    Obter resultados de análise concluída
-    
-    Args:
-        analysis_id: ID da análise
-        
-    Returns:
-        Resultados completos da análise
-    """
-    try:
-        results = analysis_service.get_analysis_results(analysis_id)
-        
-        if not results:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Resultados não encontrados: {analysis_id}"
-            )
-        
-        # Verificar se a análise foi concluída
-        if results.status not in ["completed", "error"]:
-            raise HTTPException(
-                status_code=425, 
-                detail=f"Análise ainda em andamento. Status: {results.status}"
-            )
-        
-        return results
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
-
-
-# =============================================================================
-# ENDPOINTS DE ANÁLISE DE DADOS AVANÇADA
-# =============================================================================
-
 @router.post("/analysis/start", response_model=AnalysisStartResponse)
 async def start_data_analysis(request: AnalysisStartRequest):
     """
@@ -855,7 +734,7 @@ async def start_data_analysis(request: AnalysisStartRequest):
     e inicia o processo de análise exploratória dos dados de forma assíncrona.
     
     Args:
-        request: Dados da requisição com file_key e tipo de análise
+        request: Dados da requisição com file_key, tipo de análise e opções de CSV
         
     Returns:
         ID da análise criada para acompanhamento
@@ -881,7 +760,10 @@ async def start_data_analysis(request: AnalysisStartRequest):
         analysis_id = await data_analyzer.start_analysis(
             file_key=request.file_key,
             analysis_type=request.analysis_type,
-            options=request.options
+            options={
+                **(request.options or {}),
+                "csv_options": request.csv_options.dict() if request.csv_options else None
+            }
         )
         
         return AnalysisStartResponse(
@@ -931,7 +813,104 @@ async def get_analysis_status(analysis_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
-@router.get("/analysis/results/{analysis_id}", response_model=AnalysisResults)
+def clean_pandas_objects(data: Any) -> Any:
+    """
+    Converte objetos pandas (dtype, numpy types) para tipos Python serializáveis
+    """
+    if isinstance(data, dict):
+        return {str(k): clean_pandas_objects(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [clean_pandas_objects(item) for item in data]
+    elif isinstance(data, (np.integer, np.floating)):
+        return data.item()
+    elif isinstance(data, np.ndarray):
+        return data.tolist()
+    elif hasattr(data, 'dtype') and hasattr(data, 'name'):
+        return str(data)
+    elif str(type(data)).startswith("<class 'numpy."):
+        return str(data)
+    else:
+        return data
+
+def normalize_advanced_stats_data(clean_results: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normaliza dados de advanced_stats para o modelo de resposta
+    """
+    # Normalizar correlações
+    correlations_data = clean_results.get("correlations", {})
+    
+    # Normalizar strong_correlations para o formato esperado
+    strong_correlations = correlations_data.get("strong_correlations", [])
+    normalized_strong_correlations = []
+    
+    for corr in strong_correlations:
+        if isinstance(corr, dict):
+            # Converter var1/var2 para variable1/variable2 se necessário
+            normalized_corr = {
+                "variable1": corr.get("var1") or corr.get("variable1"),
+                "variable2": corr.get("var2") or corr.get("variable2"),
+                "correlation": corr.get("correlation"),
+                "strength": corr.get("strength")
+            }
+            # Adicionar campos extras se existirem
+            for key, value in corr.items():
+                if key not in ["var1", "var2", "variable1", "variable2", "correlation", "strength"]:
+                    normalized_corr[key] = value
+            normalized_strong_correlations.append(normalized_corr)
+    
+    correlations_formatted = {
+        "correlations": {k: v for k, v in correlations_data.items() if k != "strong_correlations"},
+        "strong_correlations": normalized_strong_correlations
+    }
+    
+    # Normalizar summary para incluir campos obrigatórios se não existirem
+    summary = clean_results.get("summary", {})
+    
+    # Para advanced_stats, garantir que campos básicos estejam presentes
+    if clean_results.get("analysis_type") == "advanced_stats":
+        column_stats = clean_results.get("column_stats", [])
+        
+        # Contar tipos de colunas se não estiver no summary
+        if "numeric_columns" not in summary:
+            summary["numeric_columns"] = len([col for col in column_stats if col.get("dtype") in ["int64", "float64", "int32", "float32"]])
+        if "categorical_columns" not in summary:
+            summary["categorical_columns"] = len([col for col in column_stats if col.get("dtype") in ["object", "category"]])
+        if "datetime_columns" not in summary:
+            summary["datetime_columns"] = len([col for col in column_stats if "datetime" in str(col.get("dtype", "")).lower()])
+        if "completeness_score" not in summary:
+            # Calcular score de completude se não existir
+            total_cells = clean_results.get("dataset_info", {}).get("total_cells", 1)
+            missing_cells = clean_results.get("dataset_info", {}).get("missing_cells", 0)
+            summary["completeness_score"] = ((total_cells - missing_cells) / total_cells) * 100 if total_cells > 0 else 100.0
+    
+    clean_results["correlations"] = correlations_formatted
+    clean_results["summary"] = summary
+    
+    return clean_results
+
+def normalize_basic_eda_data(clean_results: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normaliza dados de basic_eda para o modelo de resposta
+    """
+    # Normalizar correlações para basic_eda
+    correlations_data = clean_results.get("correlations", {})
+    
+    # Para basic_eda, a estrutura é diferente - precisa encapsular em "correlations"
+    strong_correlations = correlations_data.get("strong_correlations", [])
+    
+    # Remover strong_correlations da correlations_data temporariamente
+    correlations_matrix = {k: v for k, v in correlations_data.items() if k != "strong_correlations"}
+    
+    correlations_formatted = {
+        "correlations": correlations_matrix,
+        "strong_correlations": strong_correlations
+    }
+    
+    clean_results["correlations"] = correlations_formatted
+    
+    return clean_results
+
+@router.get("/analysis/results/{analysis_id}", response_model=AnalysisResultResponse)
 async def get_analysis_results(analysis_id: str):
     """
     Obter resultados de uma análise concluída
@@ -958,16 +937,58 @@ async def get_analysis_results(analysis_id: str):
                 detail=f"Análise ainda não foi concluída. Status atual: {status['status']}"
             )
         
-        # Obter resultados
-        results = data_analyzer.get_analysis_results(analysis_id)
+        # Obter resultados brutos
+        raw_results = data_analyzer.get_analysis_results(analysis_id)
         
-        if not results:
+        if not raw_results:
             raise HTTPException(
                 status_code=404,
                 detail="Resultados não encontrados"
             )
         
-        return results
+        # Limpar objetos pandas dos dados
+        clean_results = clean_pandas_objects(raw_results)
+        
+        # Normalizar dados dependendo do tipo de análise
+        analysis_type = clean_results.get("analysis_type", "basic_eda")
+        if analysis_type == "advanced_stats":
+            clean_results = normalize_advanced_stats_data(clean_results)
+        else:
+            # Para basic_eda e outros tipos
+            clean_results = normalize_basic_eda_data(clean_results)
+        
+        # Formatar dados para o modelo correto
+        dataset_info = clean_results.get("dataset_info", {})
+        
+        # Adicionar campos opcionais se não existirem
+        if "file_size" not in dataset_info:
+            dataset_info["file_size"] = None
+        if "column_names" not in dataset_info:
+            dataset_info["column_names"] = [col["name"] for col in clean_results.get("column_stats", [])]
+        if "data_types" not in dataset_info:
+            dataset_info["data_types"] = {col["name"]: col["dtype"] for col in clean_results.get("column_stats", [])}
+        
+        # Formatar correlações (já normalizado se for advanced_stats)
+        correlations_formatted = clean_results.get("correlations", {})
+        
+        # Criar resposta estruturada
+        response_data = {
+            "analysis_id": analysis_id,
+            "status": status["status"],
+            "file_key": status.get("file_key", ""),
+            "created_at": status.get("started_at", ""),
+            "completed_at": status.get("completed_at"),
+            "results": {
+                "analysis_type": clean_results.get("analysis_type", "basic_eda"),
+                "dataset_info": dataset_info,
+                "column_stats": clean_results.get("column_stats", []),
+                "correlations": correlations_formatted,
+                "data_quality": clean_results.get("data_quality", {}),
+                "summary": clean_results.get("summary", {})
+            }
+        }
+        
+        return response_data
         
     except HTTPException:
         raise
@@ -2105,22 +2126,22 @@ async def get_endpoints():
                 "parameters": "filename (query), content_type (query, optional), folder (query, optional)"
             },
             "r2_presigned_download": {
-                "method": "GET",
-                "path": "/api/v1/r2/presigned-download/{file_key}",
+                "method": "POST",
+                "path": "/api/v1/r2/presigned-download",
                 "description": "Gerar URL pré-assinada para download do R2",
-                "parameters": "file_key (path)"
+                "parameters": "file_key (query)"
             },
             "r2_file_info": {
                 "method": "GET",
-                "path": "/api/v1/r2/file-info/{file_key}",
+                "path": "/api/v1/r2/file-info",
                 "description": "Obter informações de um arquivo no R2",
-                "parameters": "file_key (path)"
+                "parameters": "file_key (query)"
             },
             "r2_delete_file": {
                 "method": "DELETE",
-                "path": "/api/v1/r2/file/{file_key}",
+                "path": "/api/v1/r2/file",
                 "description": "Deletar arquivo do R2",
-                "parameters": "file_key (path)"
+                "parameters": "file_key (query)"
             },
             "r2_list_files": {
                 "method": "GET",
@@ -2139,8 +2160,8 @@ async def get_endpoints():
             "start_analysis": {
                 "method": "POST",
                 "path": "/api/v1/analysis/start",
-                "description": "Iniciar análise de arquivo já enviado para o R2",
-                "parameters": "AnalysisRequest (body)"
+                "description": "Iniciar análise de arquivo já enviado para o R2 com suporte a opções de CSV",
+                "parameters": "AnalysisStartRequest (body) - inclui file_key, analysis_type, options e csv_options"
             },
             "analysis_status": {
                 "method": "GET", 

@@ -96,7 +96,9 @@ class PersistentDataAnalyzer:
                     analysis_id, "processing", 25.0, "Carregando dados"
                 )
                 
-                df = await self._load_dataframe(file_content, analysis.file_key)
+                # Extrair opções de CSV se fornecidas
+                csv_options = analysis.options.get("csv_options") if analysis.options else None
+                df = await self._load_dataframe(file_content, analysis.file_key, csv_options)
                 
                 # Salvar metadados do arquivo
                 file_metadata = {
@@ -300,13 +302,49 @@ class PersistentDataAnalyzer:
             # Para produção, usar R2
             return await asyncio.to_thread(r2_service.download_file, file_key)
     
-    async def _load_dataframe(self, file_content: bytes, file_key: str) -> pd.DataFrame:
-        """Carregar DataFrame a partir do conteúdo do arquivo"""
+    async def _load_dataframe(self, file_content: bytes, file_key: str, csv_options: Optional[Dict] = None) -> pd.DataFrame:
+        """Carregar DataFrame a partir do conteúdo do arquivo com suporte a opções CSV"""
         def _load():
             file_obj = io.BytesIO(file_content)
             
             if file_key.lower().endswith('.csv'):
-                return pd.read_csv(file_obj)
+                # Preparar argumentos para pd.read_csv
+                read_args = {}
+                
+                # Aplicar opções de CSV se fornecidas
+                if csv_options:
+                    option_mapping = {
+                        'sep': 'sep',
+                        'encoding': 'encoding', 
+                        'decimal': 'decimal',
+                        'thousands': 'thousands',
+                        'parse_dates': 'parse_dates',
+                        'date_format': 'date_format',
+                        'dtype': 'dtype',
+                        'na_values': 'na_values',
+                        'quotechar': 'quotechar',
+                        'quoting': 'quoting',
+                        'skiprows': 'skiprows',
+                        'nrows': 'nrows',
+                        'header': 'header'
+                    }
+                    
+                    for option, pandas_arg in option_mapping.items():
+                        if option in csv_options and csv_options[option] is not None:
+                            read_args[pandas_arg] = csv_options[option]
+                
+                # Tentar diferentes encodings se não especificado
+                if 'encoding' not in read_args:
+                    for encoding in ['utf-8', 'latin-1', 'cp1252']:
+                        try:
+                            file_obj.seek(0)  # Reset position
+                            return pd.read_csv(file_obj, encoding=encoding, **read_args)
+                        except UnicodeDecodeError:
+                            continue
+                    raise ValueError("Não foi possível decodificar o arquivo CSV")
+                else:
+                    return pd.read_csv(file_obj, **read_args)
+                    
             elif file_key.lower().endswith(('.xlsx', '.xls')):
                 return pd.read_excel(file_obj)
             else:

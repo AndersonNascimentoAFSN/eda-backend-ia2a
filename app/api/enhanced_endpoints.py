@@ -29,7 +29,10 @@ async def start_enhanced_analysis(request: AnalysisStartRequest):
         analysis_id = await persistent_data_analyzer.start_analysis(
             file_key=request.file_key,
             analysis_type=request.analysis_type,
-            options=request.options
+            options={
+                **(request.options or {}),
+                "csv_options": request.csv_options.dict() if request.csv_options else None
+            }
         )
         
         return AnalysisStartResponse(
