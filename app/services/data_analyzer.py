@@ -326,10 +326,13 @@ class DataAnalyzer:
                     logger.info(f"📚 Lendo arquivo em chunks de {chunk_size} linhas")
                     
                     try:
+                        # Remover dtype para evitar conflitos na leitura em chunks
+                        chunk_args = {k: v for k, v in read_args.items() if k != 'dtype'}
+                        
                         chunk_reader = pd.read_csv(
                             io.BytesIO(file_content),
                             chunksize=chunk_size,
-                            **read_args
+                            **chunk_args
                         )
                         
                         for i, chunk in enumerate(chunk_reader):
@@ -348,8 +351,9 @@ class DataAnalyzer:
                         
                     except Exception as e:
                         logger.warning(f"⚠️ Falha ao ler em chunks: {e}")
-                        # Fallback para leitura normal
-                        df = pd.read_csv(io.BytesIO(file_content), encoding=encoding_to_use, **{k:v for k,v in read_args.items() if k != 'dtype'})
+                        # Fallback para leitura normal sem dtype para evitar conflitos
+                        safe_args = {k: v for k, v in read_args.items() if k != 'dtype'}
+                        df = pd.read_csv(io.BytesIO(file_content), encoding=encoding_to_use, **safe_args)
                         
                 else:
                     # Para arquivos menores, usar método normal
