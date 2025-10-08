@@ -1,23 +1,40 @@
 """
 Serviço de análise de dados EDA (Exploratory Data Analysis)
+Otimizado para uso eficiente de memória
 """
 import io
 import json
 import uuid
+import os
 import pandas as pd
 import numpy as np
+import gc
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import logging
-from scipy import stats
+try:
+    from scipy import stats
+except ImportError:
+    stats = None
 
 from app.core.r2_service import r2_service
 from app.services.visualization_service import visualization_service
 from app.services.advanced_stats_service import advanced_stats_service
 from app.services.temporal_analysis_service import temporal_analysis_service
+
+# Configurações de otimização de memória
+MEMORY_LIMITS = {
+    "small_dataset": 50 * 1024 * 1024,  # 50MB
+    "large_dataset": 100 * 1024 * 1024,  # 100MB
+    "max_rows_full_analysis": 100000,
+    "max_rows_sample": 50000,
+    "max_rows_advanced_sample": 25000,
+    "chunk_size": 10000,
+    "max_columns_correlation": 50,
+}
 from app.services.statistical_tests_service import statistical_tests_service
 
 logger = logging.getLogger(__name__)
@@ -30,11 +47,33 @@ class DataAnalysisStatus:
     ERROR = "error"
 
 class DataAnalyzer:
-    """Serviço principal de análise de dados"""
+    """Serviço principal de análise de dados com otimização de memória"""
     
     def __init__(self):
         self.analysis_cache: Dict[str, Dict] = {}
         self.executor = ThreadPoolExecutor(max_workers=4)
+        
+    def _force_garbage_collection(self):
+        """Força garbage collection para liberar memória"""
+        gc.collect()
+        
+    def _get_memory_usage_mb(self) -> float:
+        """Retorna o uso atual de memória em MB"""
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            return process.memory_info().rss / 1024 / 1024
+        except ImportError:
+            return 0.0
+            
+    def _check_memory_and_gc(self, threshold_mb: float = 200):
+        """Verifica uso de memória e força GC se necessário"""
+        current_memory = self._get_memory_usage_mb()
+        if current_memory > threshold_mb:
+            logger.info(f"🔧 Uso de memória alto ({current_memory:.1f}MB), forçando garbage collection")
+            self._force_garbage_collection()
+            new_memory = self._get_memory_usage_mb()
+            logger.info(f"✅ Memória após GC: {new_memory:.1f}MB")
     
     async def start_analysis(
         self, 
@@ -150,7 +189,7 @@ class DataAnalyzer:
     
     def _detect_csv_separator(self, file_content: bytes) -> str:
         """
-        Detecta automaticamente o separador do CSV
+        Detecta automaticamente o separador do CSV usando apenas uma amostra pequena
         
         Args:
             file_content: Conteúdo do arquivo em bytes
@@ -158,30 +197,39 @@ class DataAnalyzer:
         Returns:
             Separador detectado
         """
+        from .memory_config import MEMORY_LIMITS
+        
+        # Para arquivos grandes, usar apenas uma amostra pequena para detecção
+        sample_size = min(MEMORY_LIMITS['CSV_SEPARATOR_SAMPLE_SIZE'], len(file_content))
+        sample_content = file_content[:sample_size]
+        
         # Converter bytes para string para análise
         try:
-            text_content = file_content.decode('utf-8')
+            text_content = sample_content.decode('utf-8')
         except UnicodeDecodeError:
             try:
-                text_content = file_content.decode('latin-1')
+                text_content = sample_content.decode('latin-1')
             except UnicodeDecodeError:
-                text_content = file_content.decode('cp1252', errors='ignore')
+                text_content = sample_content.decode('cp1252', errors='ignore')
         
         # Lista de separadores possíveis em ordem de prioridade
         separators = [';', ',', '\t', '|']
         
         # Obter as primeiras linhas para análise
-        lines = text_content.split('\n')[:5]
+        lines = text_content.split('\n')[:10]  # Usar mais linhas para melhor detecção
         if not lines:
             return ','  # Default
         
         best_separator = ','
         max_columns = 1
         
+        # Usar apenas algumas linhas para teste (mais eficiente)
+        sample_lines = '\n'.join(lines[:5])
+        
         for sep in separators:
             try:
-                # Tentar ler com este separador
-                df_test = pd.read_csv(io.StringIO(text_content), sep=sep, nrows=3)
+                # Tentar ler com este separador usando apenas o sample
+                df_test = pd.read_csv(io.StringIO(sample_lines), sep=sep, nrows=3)
                 num_columns = len(df_test.columns)
                 
                 # Se conseguiu mais de 1 coluna e não tem colunas com nomes suspeitos
@@ -199,10 +247,14 @@ class DataAnalyzer:
         return best_separator
     
     async def _load_dataframe(self, file_content: bytes, file_key: str, csv_options: Optional[Dict] = None) -> pd.DataFrame:
-        """Carregar arquivo em DataFrame com suporte a opções de CSV"""
+        """Carregar arquivo em DataFrame com suporte a opções de CSV e otimização de memória"""
         try:
             # Detectar tipo de arquivo pela extensão
             file_extension = Path(file_key).suffix.lower()
+            
+            # Verificar tamanho do arquivo
+            file_size_mb = len(file_content) / (1024 * 1024)
+            logger.info(f"📁 Tamanho do arquivo: {file_size_mb:.2f} MB")
             
             if file_extension == '.csv':
                 # Detectar separador automaticamente se não especificado
@@ -218,45 +270,128 @@ class DataAnalyzer:
                 if auto_separator:
                     read_args['sep'] = auto_separator
                 
-                # Aplicar opções de CSV se fornecidas
-                if csv_options:
-                    # Mapeamento das opções
-                    option_mapping = {
-                        'sep': 'sep',
-                        'encoding': 'encoding', 
-                        'decimal': 'decimal',
-                        'thousands': 'thousands',
-                        'parse_dates': 'parse_dates',
-                        'date_format': 'date_format',
-                        'dtype': 'dtype',
-                        'na_values': 'na_values',
-                        'quotechar': 'quotechar',
-                        'quoting': 'quoting',
-                        'skiprows': 'skiprows',
-                        'nrows': 'nrows',
-                        'header': 'header'
-                    }
+                # OTIMIZAÇÕES DE MEMÓRIA para arquivos grandes
+                if file_size_mb > 50:  # Para arquivos > 50MB
+                    logger.info("🔧 Aplicando otimizações de memória para arquivo grande")
                     
-                    for option, pandas_arg in option_mapping.items():
-                        if option in csv_options and csv_options[option] is not None:
-                            read_args[pandas_arg] = csv_options[option]
-                
-                logger.info(f"🔧 Argumentos do pandas: {read_args}")
-                
-                # Tentar diferentes encodings se não especificado
-                if 'encoding' not in read_args:
+                    # Ler apenas uma amostra primeiro para otimizar dtypes
+                    sample_args = read_args.copy()
+                    sample_args['nrows'] = 1000  # Apenas 1000 linhas para análise
+                    
+                    # Tentar diferentes encodings com amostra
+                    sample_df = None
+                    encoding_to_use = 'utf-8'
+                    
                     for encoding in ['utf-8', 'latin-1', 'cp1252']:
                         try:
-                            df = pd.read_csv(io.BytesIO(file_content), encoding=encoding, **read_args)
-                            logger.info(f"✅ CSV carregado com encoding '{encoding}': {len(df)} linhas, {len(df.columns)} colunas")
+                            sample_df = pd.read_csv(
+                                io.BytesIO(file_content), 
+                                encoding=encoding, 
+                                **sample_args
+                            )
+                            encoding_to_use = encoding
+                            logger.info(f"✅ Encoding detectado: '{encoding}'")
                             break
-                        except UnicodeDecodeError:
+                        except (UnicodeDecodeError, pd.errors.ParserError):
                             continue
-                    else:
+                    
+                    if sample_df is None:
                         raise ValueError("Não foi possível decodificar o arquivo CSV")
+                    
+                    # Otimizar tipos de dados baseado na amostra
+                    optimized_dtypes = {}
+                    for col in sample_df.columns:
+                        if sample_df[col].dtype == 'object':
+                            # Tentar converter para categorias se tem muitos valores repetidos
+                            if sample_df[col].nunique() / len(sample_df) < 0.5:
+                                optimized_dtypes[col] = 'category'
+                        elif sample_df[col].dtype in ['int64', 'float64']:
+                            # Tentar usar tipos menores
+                            if sample_df[col].dtype == 'int64':
+                                if sample_df[col].min() >= -32768 and sample_df[col].max() <= 32767:
+                                    optimized_dtypes[col] = 'int16'
+                                elif sample_df[col].min() >= -2147483648 and sample_df[col].max() <= 2147483647:
+                                    optimized_dtypes[col] = 'int32'
+                            elif sample_df[col].dtype == 'float64':
+                                optimized_dtypes[col] = 'float32'
+                    
+                    # Aplicar tipos otimizados
+                    read_args['dtype'] = optimized_dtypes
+                    read_args['encoding'] = encoding_to_use
+                    
+                    # Ler em chunks para economizar memória
+                    chunk_size = 10000
+                    chunks = []
+                    
+                    logger.info(f"📚 Lendo arquivo em chunks de {chunk_size} linhas")
+                    
+                    try:
+                        chunk_reader = pd.read_csv(
+                            io.BytesIO(file_content),
+                            chunksize=chunk_size,
+                            **read_args
+                        )
+                        
+                        for i, chunk in enumerate(chunk_reader):
+                            chunks.append(chunk)
+                            if i % 10 == 0:  # Log a cada 10 chunks
+                                logger.info(f"📖 Processado chunk {i+1} ({len(chunks) * chunk_size} linhas)")
+                        
+                        # Concatenar chunks
+                        logger.info("🔄 Concatenando chunks...")
+                        df = pd.concat(chunks, ignore_index=True)
+                        
+                        # Limpar chunks da memória
+                        del chunks
+                        import gc
+                        gc.collect()
+                        
+                    except Exception as e:
+                        logger.warning(f"⚠️ Falha ao ler em chunks: {e}")
+                        # Fallback para leitura normal
+                        df = pd.read_csv(io.BytesIO(file_content), encoding=encoding_to_use, **{k:v for k,v in read_args.items() if k != 'dtype'})
+                        
                 else:
-                    df = pd.read_csv(io.BytesIO(file_content), **read_args)
-                    logger.info(f"✅ CSV carregado: {len(df)} linhas, {len(df.columns)} colunas")
+                    # Para arquivos menores, usar método normal
+                    # Aplicar opções de CSV se fornecidas
+                    if csv_options:
+                        # Mapeamento das opções
+                        option_mapping = {
+                            'sep': 'sep',
+                            'encoding': 'encoding', 
+                            'decimal': 'decimal',
+                            'thousands': 'thousands',
+                            'parse_dates': 'parse_dates',
+                            'date_format': 'date_format',
+                            'dtype': 'dtype',
+                            'na_values': 'na_values',
+                            'quotechar': 'quotechar',
+                            'quoting': 'quoting',
+                            'skiprows': 'skiprows',
+                            'nrows': 'nrows',
+                            'header': 'header'
+                        }
+                        
+                        for option, pandas_arg in option_mapping.items():
+                            if option in csv_options and csv_options[option] is not None:
+                                read_args[pandas_arg] = csv_options[option]
+                    
+                    logger.info(f"🔧 Argumentos do pandas: {read_args}")
+                    
+                    # Tentar diferentes encodings se não especificado
+                    if 'encoding' not in read_args:
+                        for encoding in ['utf-8', 'latin-1', 'cp1252']:
+                            try:
+                                df = pd.read_csv(io.BytesIO(file_content), encoding=encoding, **read_args)
+                                logger.info(f"✅ CSV carregado com encoding '{encoding}': {len(df)} linhas, {len(df.columns)} colunas")
+                                break
+                            except UnicodeDecodeError:
+                                continue
+                        else:
+                            raise ValueError("Não foi possível decodificar o arquivo CSV")
+                    else:
+                        df = pd.read_csv(io.BytesIO(file_content), **read_args)
+                        logger.info(f"✅ CSV carregado: {len(df)} linhas, {len(df.columns)} colunas")
                 
                 logger.info(f"📋 Colunas detectadas: {df.columns.tolist()}")
                     
@@ -280,276 +415,145 @@ class DataAnalyzer:
             raise ValueError(f"Erro ao carregar dados: {e}")
     
     async def _basic_eda_analysis(self, df: pd.DataFrame, file_key: str) -> Dict[str, Any]:
-        """Análise exploratória básica"""
+        """Análise exploratória básica com otimização de memória"""
+        
+        from .memory_config import MEMORY_LIMITS, SAMPLING_CONFIG, GC_SETTINGS
+        import gc
+        
+        # Verificar tamanho do dataset para aplicar otimizações
+        memory_usage_mb = df.memory_usage(deep=True).sum() / 1024 / 1024
+        is_large_dataset = (len(df) > MEMORY_LIMITS['ROW_SAMPLING_THRESHOLD'] or 
+                           memory_usage_mb > MEMORY_LIMITS['MEMORY_SAMPLING_THRESHOLD_MB'])
+        
+        if is_large_dataset:
+            logger.info(f"📊 Dataset grande detectado ({len(df)} linhas, {memory_usage_mb:.2f}MB), aplicando otimizações")
+            # Forçar garbage collection antes de processar dataset grande
+            gc.collect()
         
         # Informações básicas do dataset
         dataset_info = {
             "filename": Path(file_key).name,
             "rows": len(df),
             "columns": len(df.columns),
-            "memory_usage": df.memory_usage(deep=True).sum() / 1024 / 1024,  # MB
-            "dtypes": {str(dtype): count for dtype, count in df.dtypes.value_counts().to_dict().items()}
+            "memory_usage": memory_usage_mb,
+            "dtypes": {str(dtype): count for dtype, count in df.dtypes.value_counts().to_dict().items()},
+            "is_large_dataset": is_large_dataset
         }
         
-        # Análise por coluna
-        column_stats = []
-        for col in df.columns:
-            col_data = df[col]
-            
-            stats = {
-                "name": col,
-                "dtype": str(col_data.dtype),
-                "count": len(col_data),
-                "non_null_count": col_data.count(),
-                "null_count": col_data.isnull().sum(),
-                "null_percentage": (col_data.isnull().sum() / len(col_data)) * 100,
-                "unique_count": col_data.nunique(),
-                "most_frequent": None,
-                "frequency": None
-            }
-            
-            # Estatísticas numéricas (excluindo booleanos)
-            if pd.api.types.is_numeric_dtype(col_data) and col_data.dtype != 'bool':
-                non_null_data = col_data.dropna()
-                if not non_null_data.empty:
-                    stats.update({
-                        "mean": float(non_null_data.mean()),
-                        "median": float(non_null_data.median()),
-                        "std": float(non_null_data.std()),
-                        "variance": float(non_null_data.var()),
-                        "min": float(non_null_data.min()),
-                        "max": float(non_null_data.max()),
-                        "q25": float(non_null_data.quantile(0.25)),
-                        "q75": float(non_null_data.quantile(0.75)),
-                        "skewness": float(non_null_data.skew()),
-                        "kurtosis": float(non_null_data.kurtosis()),
-                        "range": float(non_null_data.max() - non_null_data.min()),
-                        "iqr": float(non_null_data.quantile(0.75) - non_null_data.quantile(0.25))
-                    })
-                    
-                    # Detecção de outliers usando IQR - com verificações robustas
-                    try:
-                        Q1 = non_null_data.quantile(0.25)
-                        Q3 = non_null_data.quantile(0.75)
-                        
-                        # Verificar se Q1 e Q3 são válidos (não NaN)
-                        if pd.isna(Q1) or pd.isna(Q3):
-                            # Se os quantis são NaN, definir estatísticas padrão
-                            stats.update({
-                                "outlier_count": 0,
-                                "outlier_percentage": 0.0,
-                                "outlier_bounds": {
-                                    "lower": None,
-                                    "upper": None
-                                }
-                            })
-                        else:
-                            IQR = Q3 - Q1
-                            
-                            # Verificar se IQR é válido
-                            if pd.isna(IQR) or IQR == 0:
-                                # Se IQR é 0 ou NaN, não há outliers
-                                stats.update({
-                                    "outlier_count": 0,
-                                    "outlier_percentage": 0.0,
-                                    "outlier_bounds": {
-                                        "lower": float(Q1) if not pd.isna(Q1) else None,
-                                        "upper": float(Q3) if not pd.isna(Q3) else None
-                                    }
-                                })
-                            else:
-                                # Calcular outliers de forma segura
-                                lower_bound = Q1 - 1.5 * IQR
-                                upper_bound = Q3 + 1.5 * IQR
-                                
-                                outlier_mask = (non_null_data < lower_bound) | (non_null_data > upper_bound)
-                                outliers = non_null_data[outlier_mask]
-                                
-                                stats.update({
-                                    "outlier_count": len(outliers),
-                                    "outlier_percentage": (len(outliers) / len(non_null_data)) * 100 if len(non_null_data) > 0 else 0,
-                                    "outlier_bounds": {
-                                        "lower": float(lower_bound),
-                                        "upper": float(upper_bound)
-                                    }
-                                })
-                    except Exception as e:
-                        logger.warning(f"Erro ao calcular outliers para coluna {col}: {e}")
-                        stats.update({
-                            "outlier_count": 0,
-                            "outlier_percentage": 0.0,
-                            "outlier_bounds": {
-                                "lower": None,
-                                "upper": None
-                            }
-                        })
-            else:
-                # Para colunas categóricas
-                if not col_data.empty and col_data.count() > 0:
-                    value_counts = col_data.value_counts()
-                    stats.update({
-                        "most_frequent": str(value_counts.index[0]),
-                        "frequency": int(value_counts.iloc[0]),
-                        "least_frequent": str(value_counts.index[-1]) if len(value_counts) > 0 else None,
-                        "least_frequency": int(value_counts.iloc[-1]) if len(value_counts) > 0 else None,
-                        "cardinality": len(value_counts),
-                        "top_values": value_counts.head(5).to_dict()
-                    })
-                    
-                    # Verificar se pode ser coluna temporal
-                    if col_data.dtype == 'object':
-                        try:
-                            # Tentar converter uma amostra para datetime
-                            sample = col_data.dropna().head(10)
-                            pd.to_datetime(sample)
-                            stats["potential_datetime"] = True
-                        except:
-                            stats["potential_datetime"] = False
-            
-            column_stats.append(stats)
+        logger.info(f"💾 Uso de memória: {memory_usage_mb:.2f} MB")
         
-        # Correlações (apenas para colunas numéricas)
-        numeric_columns = df.select_dtypes(include=[np.number])
-        correlations = {}
-        if len(numeric_columns.columns) > 1:
-            corr_matrix = numeric_columns.corr()
-            correlations = corr_matrix.to_dict()
+        # Para datasets grandes, usar amostragem estratificada
+        if is_large_dataset:
+            sample_size = min(SAMPLING_CONFIG['max_sample_size'], 
+                            max(SAMPLING_CONFIG['min_sample_size'], len(df)))
             
-            # Adicionar correlações mais fortes
-            strong_correlations = []
-            for i, col1 in enumerate(corr_matrix.columns):
-                for j, col2 in enumerate(corr_matrix.columns):
-                    if i < j:  # Evitar duplicatas
-                        corr_val = corr_matrix.loc[col1, col2]
-                        if abs(corr_val) > 0.5:  # Correlação significativa
-                            strong_correlations.append({
-                                "variable1": col1,
-                                "variable2": col2,
-                                "correlation": float(corr_val),
-                                "strength": "strong" if abs(corr_val) > 0.7 else "moderate"
-                            })
-            
-            correlations["strong_correlations"] = strong_correlations
+            if len(df) > sample_size:
+                # Amostragem simples e eficiente para evitar problemas de memória
+                try:
+                    # Para datasets muito grandes, usar amostragem simples apenas
+                    df_sample = df.sample(n=sample_size, random_state=SAMPLING_CONFIG['random_state'])
+                    logger.info(f"📋 Usando amostra simples de {len(df_sample)} linhas para análise detalhada")
+                except Exception:
+                    # Fallback para amostragem por índices se sample falhar
+                    step = len(df) // sample_size
+                    df_sample = df.iloc[::step].head(sample_size).copy()
+                    logger.info(f"📋 Usando amostra por índices de {len(df_sample)} linhas")
+                
+                dataset_info["sample_size"] = len(df_sample)
+            else:
+                df_sample = df
+        else:
+            df_sample = df
+        
+        # Análise por coluna com otimizações de memória
+        column_stats = []
+        
+        for i, col in enumerate(df.columns):
+            try:
+                # Usar amostra para análise detalhada
+                col_data = df_sample[col] if is_large_dataset else df[col]
+                
+                # Estatísticas básicas (sempre do dataset completo para precisão)
+                full_col_data = df[col]
+                
+                stats = {
+                    "name": col,
+                    "dtype": str(full_col_data.dtype),
+                    "count": len(full_col_data),
+                    "non_null_count": full_col_data.count(),
+                    "null_count": full_col_data.isnull().sum(),
+                    "null_percentage": (full_col_data.isnull().sum() / len(full_col_data)) * 100,
+                    "unique_count": full_col_data.nunique(),
+                    "most_frequent": None,
+                    "frequency": None
+                }
+                
+                # Estatísticas detalhadas da amostra
+                self._add_column_detailed_stats(stats, col_data, col)
+                
+                column_stats.append(stats)
+                
+                # Garbage collection a cada 20 colunas para datasets grandes
+                if is_large_dataset and i % 20 == 0 and i > 0:
+                    gc.collect()
+                
+            except Exception as e:
+                logger.warning(f"Erro ao processar coluna {col}: {e}")
+                # Adicionar estatísticas básicas mesmo em caso de erro
+                column_stats.append({
+                    "name": col,
+                    "dtype": str(df[col].dtype),
+                    "count": len(df[col]),
+                    "error": str(e)
+                })
+        
+        # Limpar referências da amostra para economizar memória
+        if is_large_dataset and 'df_sample' in locals():
+            del df_sample
+            gc.collect()
+        
+        # Correlações otimizadas
+        correlations = self._calculate_correlations_optimized(df, is_large_dataset)
         
         # Resumo e recomendações
-        completeness_score = ((df.count().sum() / (len(df) * len(df.columns))) * 100).round(1)
+        analysis_summary = self._generate_analysis_summary(df, column_stats)
         
-        recommendations = []
-        
-        # Verificar colunas com muitos valores faltantes
-        high_null_cols = [col for col in df.columns if (df[col].isnull().sum() / len(df)) > 0.5]
-        if high_null_cols:
-            recommendations.append(f"Colunas com >50% valores faltantes: {', '.join(high_null_cols[:3])}")
-        
-        # Verificar colunas categóricas com alta cardinalidade
-        high_cardinality = [col for col in df.select_dtypes(include=['object']).columns 
-                          if df[col].nunique() > len(df) * 0.8]
-        if high_cardinality:
-            recommendations.append(f"Possíveis IDs únicos: {', '.join(high_cardinality[:3])}")
-        
-        # Verificar outliers em colunas numéricas - com verificações robustas (excluindo booleanos)
-        outlier_cols = []
-        numeric_columns = df.select_dtypes(include=[np.number]).select_dtypes(exclude=['bool'])
-        for col in numeric_columns.columns:
-            try:
-                col_data = numeric_columns[col].dropna()
-                if len(col_data) == 0:
-                    continue
-                    
-                Q1 = col_data.quantile(0.25)
-                Q3 = col_data.quantile(0.75)
-                
-                # Verificar se os quantis são válidos
-                if pd.isna(Q1) or pd.isna(Q3):
-                    continue
-                    
-                IQR = Q3 - Q1
-                
-                # Verificar se IQR é válido e não zero
-                if pd.isna(IQR) or IQR == 0:
-                    continue
-                    
-                # Calcular outliers de forma segura
-                lower_bound = Q1 - 1.5 * IQR
-                upper_bound = Q3 + 1.5 * IQR
-                
-                outlier_mask = (col_data < lower_bound) | (col_data > upper_bound)
-                outliers = col_data[outlier_mask]
-                
-                if len(outliers) > 0:
-                    outlier_cols.append(col)
-            except Exception as e:
-                logger.warning(f"Erro ao verificar outliers em {col}: {e}")
-                continue
-        
-        if outlier_cols:
-            recommendations.append(f"Possíveis outliers em: {', '.join(outlier_cols[:3])}")
-        
-        # Recomendações de correlação
-        if correlations.get("strong_correlations"):
-            strong_corrs = correlations["strong_correlations"]
-            if len(strong_corrs) > 0:
-                recommendations.append(f"Correlações fortes detectadas entre {len(strong_corrs)} pares de variáveis")
-        
-        # Recomendações de qualidade geral
-        if completeness_score >= 95:
-            recommendations.append("Dataset com alta qualidade de dados")
-        elif completeness_score >= 80:
-            recommendations.append("Considerar limpeza de dados antes da análise")
-        else:
-            recommendations.append("Dataset requer limpeza significativa")
-        
-        # Detectar possíveis colunas temporais
-        potential_datetime_cols = [col["name"] for col in column_stats if col.get("potential_datetime", False)]
-        if potential_datetime_cols:
-            recommendations.append(f"Possíveis colunas de data/hora: {', '.join(potential_datetime_cols[:3])}")
-        
-        # Verificar variabilidade baixa
-        low_variance_cols = []
-        for col_stat in column_stats:
-            if col_stat.get("std") is not None and col_stat["std"] < 0.01:
-                low_variance_cols.append(col_stat["name"])
-        
-        if low_variance_cols:
-            recommendations.append(f"Colunas com baixa variabilidade: {', '.join(low_variance_cols[:3])}")
-        
-        # Contagem de tipos de colunas (excluindo booleanos das numéricas)
-        numeric_cols = df.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).select_dtypes(exclude=['bool'])
-        categorical_cols = df.select_dtypes(include=['object', 'category', 'bool'])  # Booleanos como categóricos
-        datetime_cols = df.select_dtypes(include=['datetime64'])
-        
-        logger.info(f"Tipos de colunas detectados - Numeric: {len(numeric_cols.columns)}, Categorical: {len(categorical_cols.columns)}, Datetime: {len(datetime_cols.columns)}")
-        logger.info(f"Colunas numéricas: {list(numeric_cols.columns)}")
-        logger.info(f"Colunas categóricas: {list(categorical_cols.columns)}")
+        # Garbage collection final
+        if is_large_dataset:
+            gc.collect()
         
         return {
-            "analysis_type": "basic_eda",
             "dataset_info": dataset_info,
-            "column_stats": column_stats,
+            "column_statistics": column_stats,
             "correlations": correlations,
-            "data_quality": {
-                "completeness_score": float(completeness_score),
-                "total_missing_values": int(df.isnull().sum().sum()),
-                "columns_with_missing": len([col for col in df.columns if df[col].isnull().sum() > 0]),
-                "duplicate_rows": int(df.duplicated().sum()),
-                "potential_datetime_columns": potential_datetime_cols,
-                "high_cardinality_columns": high_cardinality,
-                "low_variance_columns": low_variance_cols
-            },
-            "summary": {
-                "completeness_score": float(completeness_score),
-                "numeric_columns": len(numeric_cols.columns),
-                "categorical_columns": len(categorical_cols.columns),
-                "datetime_columns": len(datetime_cols.columns),
-                "total_outliers": sum([col.get("outlier_count", 0) for col in column_stats]),
-                "strong_correlations_count": len(correlations.get("strong_correlations", [])),
-                "recommendations": recommendations
-            }
+            "summary": analysis_summary
+        }
+        
+        # Limpar referências da amostra para economizar memória
+        if is_large_dataset and 'df_sample' in locals():
+            del df_sample
+            gc.collect()
+        
+        # Correlações otimizadas
+        correlations = self._calculate_correlations_optimized(df, is_large_dataset)
+        
+        # Resumo e recomendações
+        analysis_summary = self._generate_analysis_summary(df, column_stats)
+        
+        # Garbage collection final
+        if is_large_dataset:
+            gc.collect()
+        
+        return {
+            "dataset_info": dataset_info,
+            "column_statistics": column_stats,
+            "correlations": correlations,
+            "summary": analysis_summary
         }
     
     async def _advanced_stats_analysis(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
-        Análise estatística avançada - 100% de cobertura para LLMs
+        Análise estatística avançada com otimização de memória - 100% de cobertura para LLMs
         
         Fornece análise completa para responder a todas as perguntas sobre:
         - Descrição detalhada dos dados
@@ -559,10 +563,23 @@ class DataAnalyzer:
         - Conclusões e insights detalhados
         """
         
+        # Verificar se é um dataset grande
+        is_large_dataset = len(df) > 100000 or df.memory_usage(deep=True).sum() > 100 * 1024 * 1024
+        
+        if is_large_dataset:
+            logger.info(f"🔄 Dataset grande para análise avançada ({len(df)} linhas), aplicando otimizações")
+            # Para análise avançada, usar amostra ainda menor para evitar out of memory
+            sample_size = min(25000, len(df))
+            df_analysis = df.sample(n=sample_size, random_state=42)
+            logger.info(f"📊 Usando amostra de {sample_size} linhas para análise avançada")
+        else:
+            df_analysis = df
+        
         # 1. INFORMAÇÕES BÁSICAS DO DATASET (expandidas)
         dataset_info = {
             "filename": "advanced_analysis",
             "rows": len(df),
+            "analysis_rows": len(df_analysis),  # Número de linhas efetivamente analisadas
             "columns": len(df.columns),
             "memory_usage": df.memory_usage(deep=True).sum() / 1024 / 1024,  # MB
             "dtypes": {str(dtype): count for dtype, count in df.dtypes.value_counts().to_dict().items()},
@@ -1065,6 +1082,180 @@ class DataAnalyzer:
             "recommendations": recommendations,
             "next_steps": next_steps
         }
+    
+    def _add_column_detailed_stats(self, stats: Dict, col_data: pd.Series, col_name: str) -> None:
+        """Adicionar estatísticas detalhadas para uma coluna"""
+        try:
+            # Estatísticas numéricas (excluindo booleanos)
+            if pd.api.types.is_numeric_dtype(col_data) and col_data.dtype != 'bool':
+                non_null_data = col_data.dropna()
+                if not non_null_data.empty:
+                    stats.update({
+                        "mean": float(non_null_data.mean()),
+                        "median": float(non_null_data.median()),
+                        "std": float(non_null_data.std()),
+                        "variance": float(non_null_data.var()),
+                        "min": float(non_null_data.min()),
+                        "max": float(non_null_data.max()),
+                        "q25": float(non_null_data.quantile(0.25)),
+                        "q75": float(non_null_data.quantile(0.75)),
+                        "skewness": float(non_null_data.skew()),
+                        "kurtosis": float(non_null_data.kurtosis()),
+                        "range": float(non_null_data.max() - non_null_data.min()),
+                        "iqr": float(non_null_data.quantile(0.75) - non_null_data.quantile(0.25))
+                    })
+                
+                # Detecção de outliers usando IQR
+                self._calculate_outliers_safe(stats, non_null_data)
+            else:
+                # Para colunas categóricas
+                if not col_data.empty and col_data.count() > 0:
+                    value_counts = col_data.value_counts()
+                    stats.update({
+                        "most_frequent": str(value_counts.index[0]),
+                        "frequency": int(value_counts.iloc[0]),
+                        "least_frequent": str(value_counts.index[-1]) if len(value_counts) > 0 else None,
+                        "least_frequency": int(value_counts.iloc[-1]) if len(value_counts) > 0 else None,
+                        "cardinality": len(value_counts),
+                        "top_values": value_counts.head(5).to_dict()
+                    })
+                    
+                    # Verificar se pode ser coluna temporal
+                    if col_data.dtype == 'object':
+                        try:
+                            sample = col_data.dropna().head(10)
+                            pd.to_datetime(sample)
+                            stats["potential_datetime"] = True
+                        except:
+                            stats["potential_datetime"] = False
+        except Exception as e:
+            logger.warning(f"Erro ao calcular estatísticas detalhadas para {col_name}: {e}")
+
+    def _calculate_outliers_safe(self, stats: Dict, non_null_data: pd.Series) -> None:
+        """Calcular outliers de forma segura"""
+        try:
+            Q1 = non_null_data.quantile(0.25)
+            Q3 = non_null_data.quantile(0.75)
+            
+            if pd.isna(Q1) or pd.isna(Q3):
+                stats.update({
+                    "outlier_count": 0,
+                    "outlier_percentage": 0.0,
+                    "outlier_bounds": {"lower": None, "upper": None}
+                })
+            else:
+                IQR = Q3 - Q1
+                if pd.isna(IQR) or IQR == 0:
+                    stats.update({
+                        "outlier_count": 0,
+                        "outlier_percentage": 0.0,
+                        "outlier_bounds": {
+                            "lower": float(Q1) if not pd.isna(Q1) else None,
+                            "upper": float(Q3) if not pd.isna(Q3) else None
+                        }
+                    })
+                else:
+                    lower_bound = Q1 - 1.5 * IQR
+                    upper_bound = Q3 + 1.5 * IQR
+                    
+                    outlier_mask = (non_null_data < lower_bound) | (non_null_data > upper_bound)
+                    outliers = non_null_data[outlier_mask]
+                    
+                    stats.update({
+                        "outlier_count": len(outliers),
+                        "outlier_percentage": (len(outliers) / len(non_null_data)) * 100 if len(non_null_data) > 0 else 0,
+                        "outlier_bounds": {
+                            "lower": float(lower_bound),
+                            "upper": float(upper_bound)
+                        }
+                    })
+        except Exception as e:
+            logger.warning(f"Erro ao calcular outliers: {e}")
+            stats.update({
+                "outlier_count": 0,
+                "outlier_percentage": 0.0,
+                "outlier_bounds": {"lower": None, "upper": None}
+            })
+
+    def _calculate_correlations_optimized(self, df: pd.DataFrame, is_large_dataset: bool) -> Dict:
+        """Calcular correlações de forma otimizada"""
+        from .memory_config import SAMPLING_CONFIG
+        
+        numeric_columns = df.select_dtypes(include=[np.number]).select_dtypes(exclude=['bool'])
+        correlations = {}
+        
+        if len(numeric_columns.columns) > 1:
+            try:
+                # Para datasets grandes, usar amostra para correlações
+                if is_large_dataset and len(df) > SAMPLING_CONFIG['max_sample_size']:
+                    sample_size = min(SAMPLING_CONFIG['max_sample_size'], len(df))
+                    corr_sample = df.sample(n=sample_size, random_state=SAMPLING_CONFIG['random_state'])[numeric_columns.columns]
+                    corr_matrix = corr_sample.corr()
+                    logger.info(f"📊 Correlações calculadas usando amostra de {sample_size} linhas")
+                else:
+                    corr_matrix = numeric_columns.corr()
+                
+                correlations = corr_matrix.to_dict()
+                
+                # Adicionar correlações mais fortes
+                strong_correlations = []
+                for i, col1 in enumerate(corr_matrix.columns):
+                    for j, col2 in enumerate(corr_matrix.columns):
+                        if i < j:  # Evitar duplicatas
+                            corr_val = corr_matrix.loc[col1, col2]
+                            if abs(corr_val) > 0.5 and not pd.isna(corr_val):  # Correlação significativa
+                                strong_correlations.append({
+                                    "variable1": col1,
+                                    "variable2": col2,
+                                    "correlation": float(corr_val),
+                                    "strength": "strong" if abs(corr_val) > 0.7 else "moderate"
+                                })
+                
+                correlations["strong_correlations"] = strong_correlations
+                
+            except Exception as e:
+                logger.warning(f"Erro ao calcular correlações: {e}")
+                correlations = {"error": str(e)}
+        
+        return correlations
+
+    def _generate_analysis_summary(self, df: pd.DataFrame, column_stats: list) -> Dict:
+        """Gerar resumo da análise"""
+        try:
+            completeness_score = ((df.count().sum() / (len(df) * len(df.columns))) * 100).round(1)
+            
+            recommendations = []
+            
+            # Verificar colunas com muitos valores faltantes
+            high_null_cols = [col for col in df.columns if (df[col].isnull().sum() / len(df)) > 0.5]
+            if high_null_cols:
+                recommendations.append(f"Colunas com >50% valores faltantes: {', '.join(high_null_cols[:3])}")
+            
+            # Verificar colunas categóricas com alta cardinalidade
+            high_cardinality = [col for col in df.select_dtypes(include=['object']).columns 
+                              if df[col].nunique() > len(df) * 0.8]
+            if high_cardinality:
+                recommendations.append(f"Possíveis IDs únicos: {', '.join(high_cardinality[:3])}")
+            
+            # Verificar outliers
+            outlier_cols = []
+            for col_stat in column_stats:
+                if col_stat.get('outlier_percentage', 0) > 10:  # Mais de 10% outliers
+                    outlier_cols.append(col_stat['name'])
+            
+            if outlier_cols:
+                recommendations.append(f"Colunas com muitos outliers: {', '.join(outlier_cols[:3])}")
+            
+            return {
+                "completeness_score": completeness_score,
+                "recommendations": recommendations,
+                "total_memory_mb": df.memory_usage(deep=True).sum() / 1024 / 1024,
+                "analysis_quality": "high" if completeness_score > 90 else "medium" if completeness_score > 70 else "low"
+            }
+            
+        except Exception as e:
+            logger.warning(f"Erro ao gerar resumo: {e}")
+            return {"error": str(e)}
     
     def _calculate_dataset_health_score(self, data_quality: Dict, correlations: Dict) -> float:
         """Calcular score de saúde do dataset (0-100)"""
