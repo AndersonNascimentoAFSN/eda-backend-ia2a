@@ -964,9 +964,13 @@ async def get_analysis_results(analysis_id: str):
         if "file_size" not in dataset_info:
             dataset_info["file_size"] = None
         if "column_names" not in dataset_info:
-            dataset_info["column_names"] = [col["name"] for col in clean_results.get("column_stats", [])]
+            # Buscar em column_statistics (padrão do data_analyzer) ou column_stats (normalizado)  
+            column_data = clean_results.get("column_stats") or clean_results.get("column_statistics", [])
+            dataset_info["column_names"] = [col["name"] for col in column_data]
         if "data_types" not in dataset_info:
-            dataset_info["data_types"] = {col["name"]: col["dtype"] for col in clean_results.get("column_stats", [])}
+            # Buscar em column_statistics (padrão do data_analyzer) ou column_stats (normalizado)
+            column_data = clean_results.get("column_stats") or clean_results.get("column_statistics", [])
+            dataset_info["data_types"] = {col["name"]: col["dtype"] for col in column_data}
         
         # Formatar correlações (já normalizado se for advanced_stats)
         correlations_formatted = clean_results.get("correlations", {})
@@ -981,7 +985,7 @@ async def get_analysis_results(analysis_id: str):
             "results": {
                 "analysis_type": clean_results.get("analysis_type", "basic_eda"),
                 "dataset_info": dataset_info,
-                "column_stats": clean_results.get("column_stats", []),
+                "column_stats": clean_results.get("column_stats") or clean_results.get("column_statistics", []),
                 "correlations": correlations_formatted,
                 "data_quality": clean_results.get("data_quality", {}),
                 "summary": clean_results.get("summary", {})
