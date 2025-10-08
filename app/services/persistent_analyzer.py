@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 import pandas as pd
+from pandas.errors import ParserError
 import io
 import logging
 
@@ -156,6 +157,15 @@ class PersistentDataAnalyzer:
         except Exception as e:
             logger.error(f"Erro na análise {analysis_id}: {e}")
             
+            # Definir mensagem de erro mais específica
+            error_message = str(e)
+            if "dtype" in error_message.lower():
+                error_message = "Erro ao processar tipos de dados do arquivo CSV. Verifique se o arquivo não contém dados mistos nas colunas."
+            elif "encoding" in error_message.lower():
+                error_message = "Erro de codificação do arquivo. Tente usar UTF-8 ou especifique a codificação correta."
+            elif "chunksize" in error_message.lower() or "chunks" in error_message.lower():
+                error_message = "Erro ao processar arquivo grande. Arquivo pode estar corrompido ou ter formato inválido."
+            
             # Salvar erro no banco
             async for db_session in get_db_session():
                 repo = AnalysisRepository(db_session)
@@ -163,13 +173,13 @@ class PersistentDataAnalyzer:
                     analysis_id=analysis_id,
                     status="failed",
                     progress=0.0,
-                    message=f"Erro: {str(e)}",
+                    message=f"Erro: {error_message}",
                     completed_at=datetime.utcnow()
                 )
                 break
             
             # Notificar erro
-            await websocket_manager.send_analysis_error(analysis_id, str(e))
+            await websocket_manager.send_analysis_error(analysis_id, error_message)
             
         finally:
             # Remover da lista de tarefas ativas
@@ -333,17 +343,35 @@ class PersistentDataAnalyzer:
                         if option in csv_options and csv_options[option] is not None:
                             read_args[pandas_arg] = csv_options[option]
                 
+                # Auto-detectar separador se não fornecido
+                if 'sep' not in read_args:
+                    sample_size = min(1024 * 1024, len(file_content))  # 1MB sample
+                    sample = file_content[:sample_size].decode('utf-8', errors='ignore')
+                    
+                    separators = [',', ';', '\t', '|']
+                    sep_counts = {sep: sample.count(sep) for sep in separators}
+                    best_sep = max(sep_counts, key=sep_counts.get)
+                    
+                    if sep_counts[best_sep] > 0:
+                        read_args['sep'] = best_sep
+                        logger.info(f"Auto-detectado separador: '{best_sep}'")
+                
                 # Tentar diferentes encodings se não especificado
                 if 'encoding' not in read_args:
                     for encoding in ['utf-8', 'latin-1', 'cp1252']:
                         try:
                             file_obj.seek(0)  # Reset position
-                            return pd.read_csv(file_obj, encoding=encoding, **read_args)
-                        except UnicodeDecodeError:
+                            # Remover dtype incompatível para evitar erros de conversão
+                            safe_args = {k: v for k, v in read_args.items() if k != 'dtype'}
+                            return pd.read_csv(file_obj, encoding=encoding, **safe_args)
+                        except (UnicodeDecodeError, ValueError, ParserError) as e:
+                            logger.warning(f"Falha com encoding {encoding}: {e}")
                             continue
                     raise ValueError("Não foi possível decodificar o arquivo CSV")
                 else:
-                    return pd.read_csv(file_obj, **read_args)
+                    # Remover dtype para evitar conflitos
+                    safe_args = {k: v for k, v in read_args.items() if k != 'dtype'}
+                    return pd.read_csv(file_obj, **safe_args)
                     
             elif file_key.lower().endswith(('.xlsx', '.xls')):
                 return pd.read_excel(file_obj)
