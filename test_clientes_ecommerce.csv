@@ -1,0 +1,11 @@
+id;nome;idade;genero;cidade;estado;data_cadastro;valor_total_compras;qtd_compras;assinante_vip;avaliacao_media
+1;Ana Souza;27;Feminino;Recife;PE;2022-03-14;3250.5;8;True;4.5
+2;Carlos Lima;34;Masculino;Salvador;BA;2022-01-20;1875.25;3;False;3.8
+3;Beatriz Santos;29;Feminino;Fortaleza;CE;2022-05-08;4120.75;12;True;4.9
+4;Diego Silva;31;Masculino;João Pessoa;PB;2022-02-15;2890.0;6;False;4.2
+5;Elena Costa;25;Feminino;Maceió;AL;2022-04-22;5670.5;15;True;4.7
+6;Felipe Oliveira;38;Masculino;Aracaju;SE;2022-03-30;3450.25;9;True;4.3
+7;Gabriela Rocha;26;Feminino;Teresina;PI;2022-06-12;2150.0;4;False;3.9
+8;Henrique Melo;33;Masculino;São Luís;MA;2022-01-18;4890.75;11;True;4.6
+9;Isabela Freitas;30;Feminino;Natal;RN;2022-05-25;3780.5;7;False;4.1
+10;João Batista;45;Masculino;Natal;RN;2022-10-29;980.0;2;False;3.5

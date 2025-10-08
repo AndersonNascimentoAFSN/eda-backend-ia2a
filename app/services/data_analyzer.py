@@ -148,6 +148,56 @@ class DataAnalyzer:
         except Exception as e:
             raise ValueError(f"Erro ao baixar arquivo do R2: {e}")
     
+    def _detect_csv_separator(self, file_content: bytes) -> str:
+        """
+        Detecta automaticamente o separador do CSV
+        
+        Args:
+            file_content: Conteúdo do arquivo em bytes
+            
+        Returns:
+            Separador detectado
+        """
+        # Converter bytes para string para análise
+        try:
+            text_content = file_content.decode('utf-8')
+        except UnicodeDecodeError:
+            try:
+                text_content = file_content.decode('latin-1')
+            except UnicodeDecodeError:
+                text_content = file_content.decode('cp1252', errors='ignore')
+        
+        # Lista de separadores possíveis em ordem de prioridade
+        separators = [';', ',', '\t', '|']
+        
+        # Obter as primeiras linhas para análise
+        lines = text_content.split('\n')[:5]
+        if not lines:
+            return ','  # Default
+        
+        best_separator = ','
+        max_columns = 1
+        
+        for sep in separators:
+            try:
+                # Tentar ler com este separador
+                df_test = pd.read_csv(io.StringIO(text_content), sep=sep, nrows=3)
+                num_columns = len(df_test.columns)
+                
+                # Se conseguiu mais de 1 coluna e não tem colunas com nomes suspeitos
+                if num_columns > max_columns:
+                    # Verificar se não há nomes de coluna muito longos (indicando separador errado)
+                    max_col_name_length = max(len(str(col)) for col in df_test.columns)
+                    if max_col_name_length < 100:  # Limite razoável
+                        max_columns = num_columns
+                        best_separator = sep
+                        
+            except Exception:
+                continue
+        
+        logger.info(f"🔍 Separador detectado: '{best_separator}' (resultou em {max_columns} colunas)")
+        return best_separator
+    
     async def _load_dataframe(self, file_content: bytes, file_key: str, csv_options: Optional[Dict] = None) -> pd.DataFrame:
         """Carregar arquivo em DataFrame com suporte a opções de CSV"""
         try:
@@ -155,8 +205,18 @@ class DataAnalyzer:
             file_extension = Path(file_key).suffix.lower()
             
             if file_extension == '.csv':
+                # Detectar separador automaticamente se não especificado
+                auto_separator = None
+                if csv_options is None or 'sep' not in csv_options:
+                    auto_separator = self._detect_csv_separator(file_content)
+                    logger.info(f"📊 Separador detectado automaticamente: '{auto_separator}'")
+                
                 # Preparar argumentos para pd.read_csv
                 read_args = {}
+                
+                # Usar separador detectado se não especificado
+                if auto_separator:
+                    read_args['sep'] = auto_separator
                 
                 # Aplicar opções de CSV se fornecidas
                 if csv_options:
@@ -181,11 +241,14 @@ class DataAnalyzer:
                         if option in csv_options and csv_options[option] is not None:
                             read_args[pandas_arg] = csv_options[option]
                 
+                logger.info(f"🔧 Argumentos do pandas: {read_args}")
+                
                 # Tentar diferentes encodings se não especificado
                 if 'encoding' not in read_args:
                     for encoding in ['utf-8', 'latin-1', 'cp1252']:
                         try:
                             df = pd.read_csv(io.BytesIO(file_content), encoding=encoding, **read_args)
+                            logger.info(f"✅ CSV carregado com encoding '{encoding}': {len(df)} linhas, {len(df.columns)} colunas")
                             break
                         except UnicodeDecodeError:
                             continue
@@ -193,6 +256,9 @@ class DataAnalyzer:
                         raise ValueError("Não foi possível decodificar o arquivo CSV")
                 else:
                     df = pd.read_csv(io.BytesIO(file_content), **read_args)
+                    logger.info(f"✅ CSV carregado: {len(df)} linhas, {len(df.columns)} colunas")
+                
+                logger.info(f"📋 Colunas detectadas: {df.columns.tolist()}")
                     
             elif file_extension in ['.xlsx', '.xls']:
                 df = pd.read_excel(io.BytesIO(file_content))
@@ -242,8 +308,8 @@ class DataAnalyzer:
                 "frequency": None
             }
             
-            # Estatísticas numéricas
-            if pd.api.types.is_numeric_dtype(col_data):
+            # Estatísticas numéricas (excluindo booleanos)
+            if pd.api.types.is_numeric_dtype(col_data) and col_data.dtype != 'bool':
                 non_null_data = col_data.dropna()
                 if not non_null_data.empty:
                     stats.update({
@@ -261,20 +327,62 @@ class DataAnalyzer:
                         "iqr": float(non_null_data.quantile(0.75) - non_null_data.quantile(0.25))
                     })
                     
-                    # Detecção de outliers usando IQR
-                    Q1 = non_null_data.quantile(0.25)
-                    Q3 = non_null_data.quantile(0.75)
-                    IQR = Q3 - Q1
-                    outliers = non_null_data[(non_null_data < Q1 - 1.5 * IQR) | 
-                                           (non_null_data > Q3 + 1.5 * IQR)]
-                    stats.update({
-                        "outlier_count": len(outliers),
-                        "outlier_percentage": (len(outliers) / len(non_null_data)) * 100 if len(non_null_data) > 0 else 0,
-                        "outlier_bounds": {
-                            "lower": float(Q1 - 1.5 * IQR),
-                            "upper": float(Q3 + 1.5 * IQR)
-                        }
-                    })
+                    # Detecção de outliers usando IQR - com verificações robustas
+                    try:
+                        Q1 = non_null_data.quantile(0.25)
+                        Q3 = non_null_data.quantile(0.75)
+                        
+                        # Verificar se Q1 e Q3 são válidos (não NaN)
+                        if pd.isna(Q1) or pd.isna(Q3):
+                            # Se os quantis são NaN, definir estatísticas padrão
+                            stats.update({
+                                "outlier_count": 0,
+                                "outlier_percentage": 0.0,
+                                "outlier_bounds": {
+                                    "lower": None,
+                                    "upper": None
+                                }
+                            })
+                        else:
+                            IQR = Q3 - Q1
+                            
+                            # Verificar se IQR é válido
+                            if pd.isna(IQR) or IQR == 0:
+                                # Se IQR é 0 ou NaN, não há outliers
+                                stats.update({
+                                    "outlier_count": 0,
+                                    "outlier_percentage": 0.0,
+                                    "outlier_bounds": {
+                                        "lower": float(Q1) if not pd.isna(Q1) else None,
+                                        "upper": float(Q3) if not pd.isna(Q3) else None
+                                    }
+                                })
+                            else:
+                                # Calcular outliers de forma segura
+                                lower_bound = Q1 - 1.5 * IQR
+                                upper_bound = Q3 + 1.5 * IQR
+                                
+                                outlier_mask = (non_null_data < lower_bound) | (non_null_data > upper_bound)
+                                outliers = non_null_data[outlier_mask]
+                                
+                                stats.update({
+                                    "outlier_count": len(outliers),
+                                    "outlier_percentage": (len(outliers) / len(non_null_data)) * 100 if len(non_null_data) > 0 else 0,
+                                    "outlier_bounds": {
+                                        "lower": float(lower_bound),
+                                        "upper": float(upper_bound)
+                                    }
+                                })
+                    except Exception as e:
+                        logger.warning(f"Erro ao calcular outliers para coluna {col}: {e}")
+                        stats.update({
+                            "outlier_count": 0,
+                            "outlier_percentage": 0.0,
+                            "outlier_bounds": {
+                                "lower": None,
+                                "upper": None
+                            }
+                        })
             else:
                 # Para colunas categóricas
                 if not col_data.empty and col_data.count() > 0:
@@ -339,16 +447,40 @@ class DataAnalyzer:
         if high_cardinality:
             recommendations.append(f"Possíveis IDs únicos: {', '.join(high_cardinality[:3])}")
         
-        # Verificar outliers em colunas numéricas
+        # Verificar outliers em colunas numéricas - com verificações robustas (excluindo booleanos)
         outlier_cols = []
+        numeric_columns = df.select_dtypes(include=[np.number]).select_dtypes(exclude=['bool'])
         for col in numeric_columns.columns:
-            Q1 = numeric_columns[col].quantile(0.25)
-            Q3 = numeric_columns[col].quantile(0.75)
-            IQR = Q3 - Q1
-            outliers = numeric_columns[col][(numeric_columns[col] < Q1 - 1.5 * IQR) | 
-                                          (numeric_columns[col] > Q3 + 1.5 * IQR)]
-            if len(outliers) > 0:
-                outlier_cols.append(col)
+            try:
+                col_data = numeric_columns[col].dropna()
+                if len(col_data) == 0:
+                    continue
+                    
+                Q1 = col_data.quantile(0.25)
+                Q3 = col_data.quantile(0.75)
+                
+                # Verificar se os quantis são válidos
+                if pd.isna(Q1) or pd.isna(Q3):
+                    continue
+                    
+                IQR = Q3 - Q1
+                
+                # Verificar se IQR é válido e não zero
+                if pd.isna(IQR) or IQR == 0:
+                    continue
+                    
+                # Calcular outliers de forma segura
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                
+                outlier_mask = (col_data < lower_bound) | (col_data > upper_bound)
+                outliers = col_data[outlier_mask]
+                
+                if len(outliers) > 0:
+                    outlier_cols.append(col)
+            except Exception as e:
+                logger.warning(f"Erro ao verificar outliers em {col}: {e}")
+                continue
         
         if outlier_cols:
             recommendations.append(f"Possíveis outliers em: {', '.join(outlier_cols[:3])}")
@@ -381,9 +513,9 @@ class DataAnalyzer:
         if low_variance_cols:
             recommendations.append(f"Colunas com baixa variabilidade: {', '.join(low_variance_cols[:3])}")
         
-        # Contagem de tipos de colunas
-        numeric_cols = df.select_dtypes(include=['int64', 'float64', 'int32', 'float32'])
-        categorical_cols = df.select_dtypes(include=['object', 'category'])
+        # Contagem de tipos de colunas (excluindo booleanos das numéricas)
+        numeric_cols = df.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).select_dtypes(exclude=['bool'])
+        categorical_cols = df.select_dtypes(include=['object', 'category', 'bool'])  # Booleanos como categóricos
         datetime_cols = df.select_dtypes(include=['datetime64'])
         
         logger.info(f"Tipos de colunas detectados - Numeric: {len(numeric_cols.columns)}, Categorical: {len(categorical_cols.columns)}, Datetime: {len(datetime_cols.columns)}")
@@ -461,85 +593,116 @@ class DataAnalyzer:
                 "cardinality": col_data.nunique() / len(col_data) * 100,  # Percentual de cardinalidade
             }
             
-            # ANÁLISE PARA VARIÁVEIS NUMÉRICAS
-            if pd.api.types.is_numeric_dtype(col_data):
+            # ANÁLISE PARA VARIÁVEIS NUMÉRICAS (excluindo booleanos)
+            if pd.api.types.is_numeric_dtype(col_data) and col_data.dtype != 'bool':
                 numeric_columns.append(col)
                 non_null_data = col_data.dropna()
                 
-                if not non_null_data.empty:
-                    # Estatísticas descritivas completas
-                    q1 = non_null_data.quantile(0.25)
-                    q3 = non_null_data.quantile(0.75)
-                    iqr = q3 - q1
-                    
-                    # Detecção de outliers (múltiplos métodos)
-                    outlier_bounds_iqr = {
-                        "lower": q1 - 1.5 * iqr,
-                        "upper": q3 + 1.5 * iqr
-                    }
-                    outliers_iqr = non_null_data[(non_null_data < outlier_bounds_iqr["lower"]) | 
-                                                  (non_null_data > outlier_bounds_iqr["upper"])]
-                    
-                    # Z-score outliers
-                    z_scores = np.abs((non_null_data - non_null_data.mean()) / non_null_data.std())
-                    outliers_zscore = non_null_data[z_scores > 3]
-                    
-                    # Análise de distribuição completa
-                    skewness = non_null_data.skew()
-                    kurtosis = non_null_data.kurtosis()
-                    
-                    # Testes de normalidade
-                    normality_tests = {}
-                    try:
-                        # Shapiro-Wilk (melhor para n < 5000)
-                        if len(non_null_data) <= 5000:
-                            shapiro_stat, shapiro_p = stats.shapiro(non_null_data)
-                            normality_tests["shapiro"] = {
-                                "statistic": float(shapiro_stat),
-                                "p_value": float(shapiro_p),
-                                "is_normal": shapiro_p > 0.05
+                # Verificar se há dados numéricos válidos
+                if not non_null_data.empty and len(non_null_data) > 0:
+                        # Estatísticas descritivas completas
+                        q1 = non_null_data.quantile(0.25)
+                        q3 = non_null_data.quantile(0.75)
+                        
+                        # Verificar se os quantis são válidos
+                        if not pd.isna(q1) and not pd.isna(q3):
+                            iqr = q3 - q1
+                            
+                            # Detecção de outliers (múltiplos métodos) - com verificações
+                            if not pd.isna(iqr) and iqr != 0:
+                                outlier_bounds_iqr = {
+                                    "lower": q1 - 1.5 * iqr,
+                                    "upper": q3 + 1.5 * iqr
+                                }
+                                
+                                # Calcular outliers de forma segura
+                                outlier_mask_iqr = (non_null_data < outlier_bounds_iqr["lower"]) | (non_null_data > outlier_bounds_iqr["upper"])
+                                outliers_iqr = non_null_data[outlier_mask_iqr]
+                            else:
+                                # Se IQR é 0 ou NaN, não há outliers por IQR
+                                outlier_bounds_iqr = {"lower": float(q1), "upper": float(q3)}
+                                outliers_iqr = pd.Series([], dtype=non_null_data.dtype)
+                        else:
+                            # Se quantis são NaN, definir valores padrão
+                            iqr = 0
+                            outlier_bounds_iqr = {"lower": None, "upper": None}
+                            outliers_iqr = pd.Series([], dtype=non_null_data.dtype)
+                        
+                        # Z-score outliers - com verificações
+                        try:
+                            mean_val = non_null_data.mean()
+                            std_val = non_null_data.std()
+                            
+                            if not pd.isna(mean_val) and not pd.isna(std_val) and std_val != 0:
+                                z_scores = np.abs((non_null_data - mean_val) / std_val)
+                                outliers_zscore = non_null_data[z_scores > 3]
+                            else:
+                                outliers_zscore = pd.Series([], dtype=non_null_data.dtype)
+                        except Exception as e:
+                            logger.warning(f"Erro no cálculo de Z-score para {col}: {e}")
+                            outliers_zscore = pd.Series([], dtype=non_null_data.dtype)
+                        
+                        # Análise de distribuição completa
+                        try:
+                            skewness = non_null_data.skew()
+                            kurtosis = non_null_data.kurtosis()
+                        except Exception as e:
+                            logger.warning(f"Erro no cálculo de skewness/kurtosis para {col}: {e}")
+                            skewness = 0
+                            kurtosis = 0
+                        
+                        # Testes de normalidade
+                        normality_tests = {}
+                        try:
+                            # Shapiro-Wilk (melhor para n < 5000)
+                            if len(non_null_data) <= 5000:
+                                shapiro_stat, shapiro_p = stats.shapiro(non_null_data)
+                                normality_tests["shapiro"] = {
+                                    "statistic": float(shapiro_stat),
+                                    "p_value": float(shapiro_p),
+                                    "is_normal": shapiro_p > 0.05
+                                }
+                            
+                            # Kolmogorov-Smirnov
+                            ks_stat, ks_p = stats.kstest(non_null_data, 'norm', 
+                                                        args=(non_null_data.mean(), non_null_data.std()))
+                            normality_tests["kolmogorov_smirnov"] = {
+                                "statistic": float(ks_stat),
+                                "p_value": float(ks_p),
+                                "is_normal": ks_p > 0.05
                             }
+                            
+                            # D'Agostino
+                            dagostino_stat, dagostino_p = stats.normaltest(non_null_data)
+                            normality_tests["dagostino"] = {
+                                "statistic": float(dagostino_stat),
+                                "p_value": float(dagostino_p),
+                                "is_normal": dagostino_p > 0.05
+                            }
+                            
+                            # Anderson-Darling
+                            anderson_result = stats.anderson(non_null_data, dist='norm')
+                            normality_tests["anderson_darling"] = {
+                                "statistic": float(anderson_result.statistic),
+                                "critical_values": anderson_result.critical_values.tolist(),
+                                "significance_levels": anderson_result.significance_level.tolist()
+                            }
+                        except Exception as e:
+                            normality_tests["error"] = str(e)
                         
-                        # Kolmogorov-Smirnov
-                        ks_stat, ks_p = stats.kstest(non_null_data, 'norm', 
-                                                    args=(non_null_data.mean(), non_null_data.std()))
-                        normality_tests["kolmogorov_smirnov"] = {
-                            "statistic": float(ks_stat),
-                            "p_value": float(ks_p),
-                            "is_normal": ks_p > 0.05
-                        }
-                        
-                        # D'Agostino
-                        dagostino_stat, dagostino_p = stats.normaltest(non_null_data)
-                        normality_tests["dagostino"] = {
-                            "statistic": float(dagostino_stat),
-                            "p_value": float(dagostino_p),
-                            "is_normal": dagostino_p > 0.05
-                        }
-                        
-                        # Anderson-Darling
-                        anderson_result = stats.anderson(non_null_data, dist='norm')
-                        normality_tests["anderson_darling"] = {
-                            "statistic": float(anderson_result.statistic),
-                            "critical_values": anderson_result.critical_values.tolist(),
-                            "significance_levels": anderson_result.significance_level.tolist()
-                        }
-                    except Exception as e:
-                        normality_tests["error"] = str(e)
-                    
-                    stats.update({
-                        "mean": float(non_null_data.mean()),
-                        "median": float(non_null_data.median()),
-                        "mode": float(non_null_data.mode().iloc[0]) if not non_null_data.mode().empty else None,
-                        "std": float(non_null_data.std()),
-                        "variance": float(non_null_data.var()),
-                        "min": float(non_null_data.min()),
-                        "max": float(non_null_data.max()),
-                        "range": float(non_null_data.max() - non_null_data.min()),
-                        "q25": float(q1),
-                        "q50": float(non_null_data.median()),
-                        "q75": float(q3),
-                        "iqr": float(iqr),
+                        stats.update({
+                            "mean": float(non_null_data.mean()),
+                            "median": float(non_null_data.median()),
+                            "mode": float(non_null_data.mode().iloc[0]) if not non_null_data.mode().empty else None,
+                            "std": float(non_null_data.std()),
+                            "variance": float(non_null_data.var()),
+                            "min": float(non_null_data.min()),
+                            "max": float(non_null_data.max()),
+                            "range": float(non_null_data.max() - non_null_data.min()),
+                            "q25": float(q1),
+                            "q50": float(non_null_data.median()),
+                            "q75": float(q3),
+                            "iqr": float(iqr),
                         "skewness": float(skewness),
                         "kurtosis": float(kurtosis),
                         
